@@ -3,7 +3,6 @@ package npc
 import (
 	"errors"
 	"fmt"
-
 	coreapi "k8s.io/api/core/v1"
 	extnapi "k8s.io/api/extensions/v1beta1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -22,11 +21,12 @@ type ns struct {
 	ipt iptables.Interface // interface to iptables
 	ips ipset.Interface    // interface to ipset
 
-	name      string                     // k8s Namespace name
-	nodeName  string                     // my node name
-	namespace *coreapi.Namespace         // k8s Namespace object
-	pods      map[types.UID]*coreapi.Pod // k8s Pod objects by UID
-	policies  map[types.UID]interface{}  // k8s NetworkPolicy objects by UID
+	name            string                     // k8s Namespace name
+	nodeName        string                     // my node name
+	namespace       *coreapi.Namespace         // k8s Namespace object
+	namespaceLabels map[string]string          // k8s Namespace labels
+	pods            map[types.UID]*coreapi.Pod // k8s Pod objects by UID
+	policies        map[types.UID]interface{}  // k8s NetworkPolicy objects by UID
 
 	uid     types.UID     // surrogate UID to own allPods selector
 	allPods *selectorSpec // hash:ip ipset of all pod IPs in this namespace
@@ -55,6 +55,7 @@ func newNS(name, nodeName string, ipt iptables.Interface, ips ipset.Interface, n
 		ips:                     ips,
 		name:                    name,
 		namespace:               namespaceObj,
+		namespaceLabels:         namespaceObj.ObjectMeta.Labels,
 		nodeName:                nodeName,
 		pods:                    make(map[types.UID]*coreapi.Pod),
 		policies:                make(map[types.UID]interface{}),
@@ -188,7 +189,7 @@ func (ns *ns) addPod(obj *coreapi.Pod) error {
 		}
 	}
 
-	err = ns.namespacedPodsSelectors.addToMatchingNamespacedPodSelector(obj.ObjectMeta.UID, obj.ObjectMeta.Labels, ns.namespace.ObjectMeta.Labels, obj.Status.PodIP, podComment(obj))
+	err = ns.namespacedPodsSelectors.addToMatchingNamespacedPodSelector(obj.ObjectMeta.UID, obj.ObjectMeta.Labels, ns.namespaceLabels, obj.Status.PodIP, podComment(obj))
 	if err != nil {
 		return err
 	}
@@ -211,7 +212,7 @@ func (ns *ns) updatePod(oldObj, newObj *coreapi.Pod) error {
 		if err := ns.ips.DelEntry(oldObj.ObjectMeta.UID, ns.egressDefaultAllowIPSet, oldObj.Status.PodIP); err != nil {
 			return err
 		}
-		if err := ns.namespacedPodsSelectors.delFromMatchingNamespacedPodSelector(oldObj.ObjectMeta.UID, oldObj.ObjectMeta.Labels, ns.namespace.ObjectMeta.Labels, oldObj.Status.PodIP); err != nil {
+		if err := ns.namespacedPodsSelectors.delFromMatchingNamespacedPodSelector(oldObj.ObjectMeta.UID, oldObj.ObjectMeta.Labels, ns.namespaceLabels, oldObj.Status.PodIP); err != nil {
 			return err
 		}
 
@@ -234,7 +235,7 @@ func (ns *ns) updatePod(oldObj, newObj *coreapi.Pod) error {
 				return err
 			}
 		}
-		err = ns.namespacedPodsSelectors.addToMatchingNamespacedPodSelector(newObj.ObjectMeta.UID, newObj.ObjectMeta.Labels, ns.namespace.ObjectMeta.Labels, newObj.Status.PodIP, podComment(newObj))
+		err = ns.namespacedPodsSelectors.addToMatchingNamespacedPodSelector(newObj.ObjectMeta.UID, newObj.ObjectMeta.Labels, ns.namespaceLabels, newObj.Status.PodIP, podComment(newObj))
 		if err != nil {
 			return err
 		}
@@ -279,8 +280,8 @@ func (ns *ns) updatePod(oldObj, newObj *coreapi.Pod) error {
 			}
 		}
 		for _, ps := range ns.namespacedPodsSelectors.entries {
-			oldMatch := ps.matchesNamespacedPodSelector(oldObj.ObjectMeta.Labels, ns.namespace.ObjectMeta.Labels)
-			newMatch := ps.matchesNamespacedPodSelector(newObj.ObjectMeta.Labels, ns.namespace.ObjectMeta.Labels)
+			oldMatch := ps.matchesNamespacedPodSelector(oldObj.ObjectMeta.Labels, ns.namespaceLabels)
+			newMatch := ps.matchesNamespacedPodSelector(newObj.ObjectMeta.Labels, ns.namespaceLabels)
 			if oldMatch == newMatch && oldObj.Status.PodIP == newObj.Status.PodIP {
 				continue
 			}
@@ -333,7 +334,7 @@ func (ns *ns) deletePod(obj *coreapi.Pod) error {
 	if err := ns.podSelectors.delFromMatchingPodSelector(obj.ObjectMeta.UID, obj.ObjectMeta.Labels, obj.Status.PodIP); err != nil {
 		return err
 	}
-	if err := ns.namespacedPodsSelectors.delFromMatchingNamespacedPodSelector(obj.ObjectMeta.UID, obj.ObjectMeta.Labels, ns.namespace.ObjectMeta.Labels, obj.Status.PodIP); err != nil {
+	if err := ns.namespacedPodsSelectors.delFromMatchingNamespacedPodSelector(obj.ObjectMeta.UID, obj.ObjectMeta.Labels, ns.namespaceLabels, obj.Status.PodIP); err != nil {
 		return err
 	}
 	return nil
@@ -496,6 +497,7 @@ func (ns *ns) deleteBypassRules() error {
 
 func (ns *ns) addNamespace(obj *coreapi.Namespace) error {
 	ns.namespace = obj
+	ns.namespaceLabels = obj.ObjectMeta.Labels
 
 	// Insert a rule to bypass policies
 	if err := ns.ensureBypassRules(); err != nil {
@@ -512,6 +514,8 @@ func (ns *ns) updateNamespace(oldObj, newObj *coreapi.Namespace) error {
 
 	// Re-evaluate namespace selector membership if labels have changed
 	if !equals(oldObj.ObjectMeta.Labels, newObj.ObjectMeta.Labels) {
+		ns.namespaceLabels = newObj.ObjectMeta.Labels
+
 		for _, selector := range ns.nsSelectors.entries {
 			oldMatch := selector.matchesNamespaceSelector(oldObj.ObjectMeta.Labels)
 			newMatch := selector.matchesNamespaceSelector(newObj.ObjectMeta.Labels)
